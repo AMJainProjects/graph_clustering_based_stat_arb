@@ -14,6 +14,7 @@ from scipy.spatial.distance import squareform
 import tensorflow as tf
 from tensorflow.keras.layers import Input, Dense
 from tensorflow.keras.models import Model
+from scipy.linalg import eigh
 from sklearn.preprocessing import StandardScaler
 
 
@@ -144,46 +145,78 @@ def sponge_clustering(
     Returns:
         Array of cluster labels for each stock
     """
-    # Step 1: Decompose the correlation matrix into positive and negative parts
-    A_pos, A_neg = decompose_correlation_matrix(correlation_matrix)
-
-    # Step 2: Compute the Laplacian matrices for positive and negative parts
-    D_pos = compute_degree_matrix(A_pos)
-    D_neg = compute_degree_matrix(A_neg)
-
-    L_pos = D_pos - A_pos
-    L_neg = D_neg - A_neg
-
-    if use_symmetric:
-        # Use symmetric normalization for both Laplacians
-        L_pos_sym = normalize_by_degree(L_pos, D_pos, method='symmetric')
-        L_neg_sym = normalize_by_degree(L_neg, D_neg, method='symmetric')
-
-        # Prepare matrices for generalized eigenvalue problem
-        A = L_pos_sym + tau_n * np.eye(len(correlation_matrix))
-        B = L_neg_sym + tau_p * np.eye(len(correlation_matrix))
+    # Convert pandas DataFrame to numpy array if needed
+    if isinstance(correlation_matrix, pd.DataFrame):
+        corr_array = correlation_matrix.values
     else:
-        # Prepare matrices for generalized eigenvalue problem
+        corr_array = correlation_matrix
+
+    # Step 1: Decompose the correlation matrix into positive and negative parts
+    pos_corr = np.maximum(0, corr_array)
+    neg_corr = np.maximum(0, -corr_array)
+
+    # Step 2: Create Laplacian matrices
+    # Positive Laplacian
+    D_pos = np.diag(np.sum(pos_corr, axis=1))
+    L_pos = D_pos - pos_corr
+
+    # Negative Laplacian
+    D_neg = np.diag(np.sum(neg_corr, axis=1))
+    L_neg = D_neg - neg_corr
+
+    # Create matrices for generalized eigenvalue problem
+    if use_symmetric:
+        # For symmetric normalization
+        D_pos_inv_sqrt = np.diag(1.0 / np.sqrt(np.maximum(np.diag(D_pos), 1e-10)))
+        D_neg_inv_sqrt = np.diag(1.0 / np.sqrt(np.maximum(np.diag(D_neg), 1e-10)))
+
+        A_sym = D_pos_inv_sqrt @ L_pos @ D_pos_inv_sqrt + tau_n * np.eye(len(corr_array))
+        B_sym = D_neg_inv_sqrt @ L_neg @ D_neg_inv_sqrt + tau_p * np.eye(len(corr_array))
+
+        A = A_sym
+        B = B_sym
+    else:
+        # Standard version
         A = L_pos + tau_n * D_neg
         B = L_neg + tau_p * D_pos
 
     # Step 3: Solve the generalized eigenvalue problem A*v = lambda*B*v
     # Find the k smallest generalized eigenvalues/eigenvectors
-    eigenvalues, eigenvectors = sparse.linalg.eigsh(
-        A=A, M=B, k=n_clusters, sigma=0, which='LM'
-    )
+    try:
+        eigenvalues, eigenvectors = sparse.linalg.eigsh(
+            A=A, M=B, k=n_clusters, sigma=0, which='LM'
+        )
+    except Exception as e:
+        print(f"Error in eigsh: {e}")
+        print("Trying alternative approach...")
+        try:
+            # Compute B^(-1/2)
+            B_eig_val, B_eig_vec = eigh(B)
+            B_eig_val = np.maximum(B_eig_val, 1e-10)  # Ensure positive eigenvalues
+            B_inv_sqrt = B_eig_vec @ np.diag(1.0 / np.sqrt(B_eig_val)) @ B_eig_vec.T
 
-    # Step 4: Cluster the points in the embedding space
-    kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+            # Transform to standard eigenvalue problem
+            C = B_inv_sqrt @ A @ B_inv_sqrt
+            eigenvalues, temp_eigenvectors = eigh(C, subset_by_index=[0, n_clusters - 1])
+            eigenvectors = B_inv_sqrt @ temp_eigenvectors
+        except Exception as e2:
+            print(f"Alternative approach also failed: {e2}")
+            # Last resort: just use k-means directly on the correlation matrix
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+            return kmeans.fit_predict(corr_array), n_clusters
+
+    # Step 4: Apply k-means clustering to the eigenvectors
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
     labels = kmeans.fit_predict(eigenvectors)
 
-    return labels
+    return labels, n_clusters
 
 
 def determine_clusters_mp(
         correlation_matrix: pd.DataFrame,
         T: int,
-        significance_level: float = 0.01
+        significance_level: float = 0.01,
+        adjusted_threshold: float = 0.7
 ) -> int:
     """
     Determines the number of clusters using the Marchenko-Pastur distribution.
@@ -207,7 +240,7 @@ def determine_clusters_mp(
     rho = N / T
 
     # Calculate the upper bound of the MP distribution
-    lambda_max = (1 + np.sqrt(rho)) ** 2
+    lambda_max = ((1 + np.sqrt(rho)) ** 2) * adjusted_threshold
 
     # Count eigenvalues above the threshold
     n_clusters = np.sum(eigenvalues > lambda_max)
@@ -253,7 +286,7 @@ def hierarchical_clustering(
         correlation_matrix: pd.DataFrame,
         n_clusters: int,
         method: str = 'ward'
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Performs hierarchical clustering on the correlation matrix.
 
@@ -268,14 +301,43 @@ def hierarchical_clustering(
     # Convert correlation to distance
     distance_matrix = 1 - np.abs(correlation_matrix)
 
-    # Perform hierarchical clustering
-    condensed_dist = squareform(distance_matrix)
-    Z = linkage(condensed_dist, method=method)
+    # Force symmetry by averaging with transpose
+    distance_matrix = (distance_matrix + distance_matrix.T) / 2
 
-    # Cut the dendrogram to get n_clusters
-    labels = fcluster(Z, n_clusters, criterion='maxclust') - 1  # zero-based
+    try:
+        # Perform hierarchical clustering
+        condensed_dist = squareform(distance_matrix)
+        Z = linkage(condensed_dist, method=method)
 
-    return labels, Z
+        # Cut the dendrogram to get n_clusters
+        labels = fcluster(Z, n_clusters, criterion='maxclust') - 1  # zero-based
+
+        return labels, Z
+
+    except Exception as e:
+        print(f"Warning: Hierarchical clustering error: {e}")
+        print("Falling back to sklearn's AgglomerativeClustering")
+
+        # Fallback to sklearn's implementation which is more robust
+        from sklearn.cluster import AgglomerativeClustering
+
+        # Note: 'ward' linkage requires euclidean distances, not precomputed
+        if method == 'ward':
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                linkage='average'  # Fallback to average linkage
+            )
+            labels = clustering.fit_predict(distance_matrix.values)
+        else:
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                affinity='precomputed',
+                linkage=method
+            )
+            labels = clustering.fit_predict(distance_matrix)
+
+        # Return labels and empty linkage matrix
+        return labels, np.array([])
 
 
 def dynamic_tree_cut(
@@ -397,7 +459,8 @@ def deep_embedding_clustering(
         n_clusters: int = 10,
         embedding_dim: int = 10,
         epochs: int = 100,
-        batch_size: int = 32
+        batch_size: int = 32,
+        **kwargs
 ) -> Tuple[np.ndarray, np.ndarray, object]:
     """
     Deep embedding clustering for returns data.
@@ -463,6 +526,21 @@ def deep_embedding_clustering(
     from sklearn.cluster import KMeans
     kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
     labels = kmeans.fit_predict(embeddings)
+
+    # NEW: Check for empty clusters and reduce if needed
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    empty_clusters = [i for i in range(n_clusters) if i not in unique_labels]
+    small_clusters = [label for label, count in zip(unique_labels, counts) if count < kwargs['min_cluster_size']]
+
+    if empty_clusters or small_clusters:
+        print(f"Found {len(empty_clusters)} empty clusters and {len(small_clusters)} small clusters")
+
+        # Automatically reduce number of clusters if needed
+        active_clusters = n_clusters - len(empty_clusters)
+        if active_clusters >= 2 and active_clusters < n_clusters:
+            print(f"Reducing to {active_clusters} clusters and reclassifying")
+            kmeans = KMeans(n_clusters=active_clusters, n_init=10, random_state=42)
+            labels = kmeans.fit_predict(embeddings)
 
     return labels, embeddings, encoder
 
@@ -555,26 +633,47 @@ def cluster_stocks(
     return labels, n_clusters
 
 
-def get_clusters_dict(
-        labels: np.ndarray,
-        tickers: List[str]
-) -> dict:
+def get_clusters_dict(labels, tickers):
     """
-    Creates a dictionary mapping cluster labels to lists of tickers.
+    Convert cluster labels into a dictionary of clusters.
 
     Args:
-        labels: Array of cluster assignments
+        labels: Cluster labels for each stock
         tickers: List of stock tickers
 
     Returns:
-        Dictionary mapping cluster IDs to lists of tickers
+        Dictionary mapping cluster labels to lists of tickers
     """
     clusters = {}
+    # Handle tuple case first
+    if isinstance(labels, tuple) and len(labels) >= 1:
+        print("Detected tuple of (labels, n_clusters). Extracting labels...")
+        # Make sure we're getting the array of labels, not the count
+        if isinstance(labels[0], (np.ndarray, list)) or hasattr(labels[0], '__iter__'):
+            extracted_labels = labels[0]
+        else:
+            # If first element is a scalar, try the second element
+            extracted_labels = labels[1] if len(labels) > 1 else labels[0]
+        labels = extracted_labels
 
+    # Convert complex labels to simple format
+    if isinstance(labels, np.ndarray) and labels.ndim > 1:
+        print(f"Warning: labels is {labels.ndim}-dimensional. Flattening...")
+        labels = np.argmax(labels, axis=1) if labels.shape[1] > 1 else labels.flatten()
+
+    # Create the clusters dictionary
     for i, label in enumerate(labels):
+        # Convert numpy types to Python native types for hashability
+        if isinstance(label, np.ndarray):
+            label = int(label.item()) if label.size == 1 else tuple(label.tolist())
+        elif isinstance(label, np.integer):
+            label = int(label)
+
         if label not in clusters:
             clusters[label] = []
-        clusters[label].append(tickers[i])
+
+        if i < len(tickers):  # Safety check
+            clusters[label].append(tickers[i])
 
     return clusters
 
@@ -645,4 +744,6 @@ if __name__ == "__main__":
         for cluster_id, cluster_tickers in deep_clusters.items():
             print(f"Cluster {cluster_id}: {', '.join(cluster_tickers)}")
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         print(f"Error with deep embedding clustering: {e}")

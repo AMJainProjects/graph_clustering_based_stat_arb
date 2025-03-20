@@ -166,7 +166,7 @@ def normalize_by_degree(
         Normalized DataFrame
     """
     # Extract the degrees (diagonal of the degree matrix)
-    degrees = np.diag(degree_matrix.values)
+    degrees = np.diag(degree_matrix.values).copy()
     
     # Ensure no division by zero
     degrees[degrees == 0] = 1e-10

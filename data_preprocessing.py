@@ -12,34 +12,74 @@ def fetch_stock_data(
         tickers: List[str],
         start_date: str,
         end_date: str,
-        include_market: bool = True
+        include_market: bool = True,
+        batch_size: int = 10  # Added parameter for batch processing
 ) -> pd.DataFrame:
     """
     Fetches historical stock price data for the given tickers.
+    Implements batch processing to handle large lists of tickers.
 
     Args:
         tickers: List of stock ticker symbols
         start_date: Start date in 'YYYY-MM-DD' format
         end_date: End date in 'YYYY-MM-DD' format
         include_market: Whether to include SPY as market proxy
+        batch_size: Number of tickers to fetch in each batch
 
     Returns:
         DataFrame with daily adjusted closing prices for each ticker
     """
     # Add SPY as market proxy if not already included
     if include_market and 'SPY' not in tickers:
-        tickers = tickers + ['SPY']
+        all_tickers = tickers + ['SPY']
+    else:
+        all_tickers = tickers.copy()
 
-    # Fetch data
-    data = yf.download(tickers, start=start_date, end=end_date, progress=False)
+    # Initialize an empty DataFrame for prices
+    all_prices = pd.DataFrame()
 
-    # Extract adjusted close prices
-    prices = data['Adj Close']
+    # Process tickers in batches
+    for i in range(0, len(all_tickers), batch_size):
+        batch_tickers = all_tickers[i:i + batch_size]
+        print(f"Fetching batch {i // batch_size + 1} with {len(batch_tickers)} tickers")
+
+        try:
+            # Fetch data for this batch
+            batch_data = yf.download(
+                batch_tickers,
+                start=start_date,
+                end=end_date,
+                progress=True,
+                auto_adjust=False,
+                threads=False
+            )
+
+            # Extract adjusted close prices
+            if len(batch_tickers) == 1:
+                # Handle the case of a single ticker (which returns a different format)
+                ticker = batch_tickers[0]
+                batch_prices = batch_data['Adj Close'].to_frame(ticker)
+            else:
+                batch_prices = batch_data['Adj Close']
+
+            # Merge with the main DataFrame
+            if all_prices.empty:
+                all_prices = batch_prices
+            else:
+                all_prices = all_prices.join(batch_prices, how='outer')
+
+        except Exception as e:
+            print(f"Error fetching batch {i // batch_size + 1}: {e}")
+            # Continue with the next batch instead of failing completely
+            continue
 
     # Forward fill any missing values (e.g., non-trading days)
-    prices = prices.ffill()
+    all_prices = all_prices.ffill()
 
-    return prices
+    if all_prices.empty:
+        raise ValueError("Failed to fetch any stock data")
+
+    return all_prices
 
 
 def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
@@ -52,7 +92,7 @@ def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with daily returns
     """
-    returns = prices.pct_change().dropna()
+    returns = prices.pct_change().ffill().bfill()
     return returns
 
 
@@ -109,7 +149,7 @@ def filter_stocks_by_market_cap(
         Filtered list of ticker symbols
     """
     market_caps = get_market_cap_data(tickers, date)
-    market_caps = market_caps.dropna()
+    market_caps = market_caps.ffill().bfill()
 
     threshold = market_caps['marketCap'].quantile(percentile)
     top_tickers = market_caps[market_caps['marketCap'] >= threshold].index.tolist()
@@ -120,7 +160,8 @@ def filter_stocks_by_market_cap(
 def calculate_betas(
         returns: pd.DataFrame,
         market_ticker: str = 'SPY',
-        window: int = 60
+        window: int = 60,
+        include_market: bool = True  # New parameter to include market ticker
 ) -> pd.DataFrame:
     """
     Calculates rolling betas for each stock against the market.
@@ -129,23 +170,39 @@ def calculate_betas(
         returns: DataFrame with daily returns
         market_ticker: Market proxy ticker symbol
         window: Rolling window size in days
+        include_market: Whether to include the market ticker in the output
 
     Returns:
         DataFrame with beta values for each stock and date
     """
-    betas = pd.DataFrame(index=returns.index[window:], columns=returns.columns.drop(market_ticker))
+    # Determine which columns to include in the output
+    if include_market:
+        # Include all columns
+        output_columns = returns.columns
+    else:
+        # Exclude the market ticker (traditional approach)
+        output_columns = returns.columns.drop(market_ticker)
 
+    # Initialize the betas DataFrame
+    betas = pd.DataFrame(index=returns.index[window:], columns=output_columns)
+
+    # Get market returns
     market_returns = returns[market_ticker]
 
-    for ticker in returns.columns.drop(market_ticker):
-        stock_returns = returns[ticker]
+    # Calculate rolling betas for each stock
+    for ticker in output_columns:
+        if ticker == market_ticker and include_market:
+            # Set beta = 1 for the market itself
+            betas[ticker] = 1.0
+        else:
+            stock_returns = returns[ticker]
 
-        # Calculate rolling betas using covariance and variance
-        rolling_cov = stock_returns.rolling(window=window).cov(market_returns)
-        rolling_var = market_returns.rolling(window=window).var()
+            # Calculate rolling betas using covariance and variance
+            rolling_cov = stock_returns.rolling(window=window).cov(market_returns)
+            rolling_var = market_returns.rolling(window=window).var()
 
-        rolling_beta = rolling_cov / rolling_var
-        betas[ticker] = rolling_beta[window:]
+            rolling_beta = rolling_cov / rolling_var
+            betas[ticker] = rolling_beta[window:]
 
     return betas
 
@@ -166,16 +223,24 @@ def calculate_residual_returns(
     Returns:
         DataFrame with residual returns
     """
+    # Initialize residual returns with the same columns as betas
     residual_returns = pd.DataFrame(index=betas.index, columns=betas.columns)
 
+    # Get market returns for the same dates as in betas
     market_returns = returns.loc[betas.index, market_ticker]
 
+    # Calculate residual returns for each stock
     for ticker in betas.columns:
-        stock_returns = returns.loc[betas.index, ticker]
-        stock_betas = betas[ticker]
+        if ticker == market_ticker:
+            # For the market itself, residual returns should be 0
+            # (perfect correlation with itself means no unexplained component)
+            residual_returns[ticker] = 0.0
+        else:
+            stock_returns = returns.loc[betas.index, ticker]
+            stock_betas = betas[ticker]
 
-        # Calculate residual returns: R_res = R - beta * R_mkt
-        residual_returns[ticker] = stock_returns - stock_betas * market_returns
+            # Calculate residual returns: R_res = R - beta * R_mkt
+            residual_returns[ticker] = stock_returns - stock_betas * market_returns
 
     return residual_returns
 
@@ -185,7 +250,9 @@ def prepare_stock_data(
         start_date: str,
         end_date: str,
         beta_window: int = 60,
-        market_cap_percentile: float = 0.75
+        market_cap_percentile: float = 0.75,
+        apply_market_cap_filter: bool = False,  # Added parameter to make filtering optional
+        include_market_in_results: bool = True  # New parameter to include SPY in results
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     End-to-end function to prepare stock data for analysis.
@@ -196,27 +263,38 @@ def prepare_stock_data(
         end_date: End date in 'YYYY-MM-DD' format
         beta_window: Window for beta calculation in days
         market_cap_percentile: Percentile for market cap filtering
+        apply_market_cap_filter: Whether to apply market cap filtering (default: False)
+        include_market_in_results: Whether to include market (SPY) in betas and residuals
 
     Returns:
         Tuple of (returns, betas, residual_returns) DataFrames
     """
-    # Filter stocks by market cap
-    filtered_tickers = filter_stocks_by_market_cap(tickers, market_cap_percentile)
+    # Filter stocks by market cap only if requested
+    if apply_market_cap_filter:
+        filtered_tickers = filter_stocks_by_market_cap(tickers, market_cap_percentile)
+        print(f"Market cap filter applied. Kept {len(filtered_tickers)} out of {len(tickers)} tickers.")
+    else:
+        filtered_tickers = tickers
+        print(f"No market cap filter applied. Using all {len(tickers)} tickers.")
 
-    # Fetch data
-    prices = fetch_stock_data(filtered_tickers, start_date, end_date)
+    # Fetch data with improved error handling
+    try:
+        prices = fetch_stock_data(filtered_tickers, start_date, end_date)
+        print(f"Successfully fetched data for {len(prices.columns)} out of {len(filtered_tickers)} tickers.")
+    except Exception as e:
+        print(f"Error in fetch_stock_data: {e}")
+        raise
 
     # Calculate returns
     returns = calculate_returns(prices)
 
-    # Calculate betas
-    betas = calculate_betas(returns, window=beta_window)
+    # Calculate betas (now with option to include market ticker)
+    betas = calculate_betas(returns, window=beta_window, include_market=include_market_in_results)
 
     # Calculate residual returns
     residual_returns = calculate_residual_returns(returns, betas)
 
     return returns, betas, residual_returns
-
 
 # ==================== NEW ADVANCED FACTOR MODELS ====================
 
@@ -274,7 +352,9 @@ def fetch_fama_french_factors(start_date: str, end_date: str) -> pd.DataFrame:
 def calculate_multifactor_residuals(
         returns: pd.DataFrame,
         factor_returns: pd.DataFrame,
-        rolling_window: Optional[int] = None
+        rolling_window: Optional[int] = None,
+        market_ticker: str = 'SPY',
+        include_market: bool = True
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """
     Calculates residual returns using a multi-factor model.
@@ -283,6 +363,8 @@ def calculate_multifactor_residuals(
         returns: DataFrame with stock returns
         factor_returns: DataFrame with factor returns
         rolling_window: Optional window for rolling regression
+        market_ticker: Market proxy ticker symbol
+        include_market: Whether to include the market ticker in output
 
     Returns:
         Tuple of (residual_returns, factor_betas)
@@ -292,17 +374,38 @@ def calculate_multifactor_residuals(
     aligned_returns = returns.loc[common_dates]
     aligned_factors = factor_returns.loc[common_dates]
 
+    # Determine which columns to include in the output
+    if include_market and market_ticker in returns.columns:
+        output_columns = returns.columns
+    else:
+        output_columns = returns.columns.drop(market_ticker) if market_ticker in returns.columns else returns.columns
+
     # Initialize output DataFrames
-    residual_returns = pd.DataFrame(index=common_dates, columns=returns.columns)
+    residual_returns = pd.DataFrame(index=common_dates, columns=output_columns)
     factor_betas = {ticker: pd.DataFrame(index=common_dates, columns=factor_returns.columns)
-                    for ticker in returns.columns}
+                    for ticker in output_columns}
 
     # Prepare factors (add constant)
     X = sm.add_constant(aligned_factors)
 
+    # Special handling for market ticker if it's included
+    if include_market and market_ticker in returns.columns:
+        # If 'MKT' is one of the factors, the market ticker should be highly correlated with it
+        if 'MKT' in factor_returns.columns:
+            # For the market itself, set the MKT beta to 1.0 and others to 0.0
+            for factor in factor_returns.columns:
+                factor_betas[market_ticker][factor] = 1.0 if factor == 'MKT' else 0.0
+
+            # Set residual returns for market to 0 (perfectly explained by the MKT factor)
+            residual_returns[market_ticker] = 0.0
+
     if rolling_window is None:
         # Static regression for the entire period
-        for ticker in aligned_returns.columns:
+        for ticker in output_columns:
+            # Skip market ticker if it's been handled above
+            if ticker == market_ticker and include_market and 'MKT' in factor_returns.columns:
+                continue
+
             y = aligned_returns[ticker]
 
             # Fit linear model
@@ -322,7 +425,11 @@ def calculate_multifactor_residuals(
 
     else:
         # Rolling regression
-        for ticker in aligned_returns.columns:
+        for ticker in output_columns:
+            # Skip market ticker if it's been handled above
+            if ticker == market_ticker and include_market and 'MKT' in factor_returns.columns:
+                continue
+
             y = aligned_returns[ticker]
 
             # Initialize with NaN
@@ -358,8 +465,8 @@ def calculate_multifactor_residuals(
                     residual_returns.loc[current_date, ticker] = y.iloc[i - 1]
 
         # Forward fill betas
-        for ticker in returns.columns:
-            factor_betas[ticker] = factor_betas[ticker].fillna(method='ffill')
+        for ticker in output_columns:
+            factor_betas[ticker] = factor_betas[ticker].ffill().bfill()
 
     return residual_returns, factor_betas
 
@@ -489,7 +596,9 @@ def prepare_multifactor_data(
         use_pca: bool = False,
         n_components: Optional[int] = None,
         rolling_window: Optional[int] = None,
-        market_cap_percentile: float = 0.75
+        market_cap_percentile: float = 0.75,
+        apply_market_cap_filter: bool = False,  # Added parameter
+        include_market_in_results: bool = True  # Added parameter
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict]:
     """
     End-to-end function to prepare stock data using a multi-factor model.
@@ -503,12 +612,19 @@ def prepare_multifactor_data(
         n_components: Number of PCA components (if use_pca is True)
         rolling_window: Window for rolling regression
         market_cap_percentile: Percentile for market cap filtering
+        apply_market_cap_filter: Whether to apply market cap filtering
+        include_market_in_results: Whether to include market (SPY) in results
 
     Returns:
         Tuple of (returns, factor_returns, residual_returns, factor_data)
     """
-    # Filter stocks by market cap
-    filtered_tickers = filter_stocks_by_market_cap(tickers, market_cap_percentile)
+    # Filter stocks by market cap if requested
+    if apply_market_cap_filter:
+        filtered_tickers = filter_stocks_by_market_cap(tickers, market_cap_percentile)
+        print(f"Market cap filter applied. Kept {len(filtered_tickers)} out of {len(tickers)} tickers.")
+    else:
+        filtered_tickers = tickers
+        print(f"No market cap filter applied. Using all {len(tickers)} tickers.")
 
     # Fetch price data
     prices = fetch_stock_data(filtered_tickers, start_date, end_date)
@@ -522,7 +638,9 @@ def prepare_multifactor_data(
     if factor_model == 'capm':
         # CAPM (single-factor market model)
         market_ticker = 'SPY'
-        betas = calculate_betas(returns, market_ticker=market_ticker, window=rolling_window or 60)
+        betas = calculate_betas(returns, market_ticker=market_ticker,
+                                window=rolling_window or 60,
+                                include_market=include_market_in_results)
         residual_returns = calculate_residual_returns(returns, betas, market_ticker=market_ticker)
 
         # Create factor returns DataFrame with just market
@@ -536,8 +654,15 @@ def prepare_multifactor_data(
         ff_factors = fetch_fama_french_factors(adjusted_start.strftime('%Y-%m-%d'), end_date)
 
         # Calculate residuals using Fama-French factors
+        if include_market_in_results:
+            # Keep SPY in the data for calculation
+            ticker_returns = returns
+        else:
+            # Drop SPY for traditional calculation
+            ticker_returns = returns.drop('SPY', axis=1) if 'SPY' in returns.columns else returns
+
         residual_returns, factor_betas = calculate_multifactor_residuals(
-            returns.drop('SPY', axis=1) if 'SPY' in returns.columns else returns,
+            ticker_returns,
             ff_factors,
             rolling_window
         )
@@ -547,9 +672,15 @@ def prepare_multifactor_data(
 
     elif factor_model == 'pca':
         # Pure PCA model
-        non_market_returns = returns.drop('SPY', axis=1) if 'SPY' in returns.columns else returns
+        if include_market_in_results:
+            # Keep SPY in the data for PCA
+            ticker_returns = returns
+        else:
+            # Traditional approach: exclude market from PCA
+            ticker_returns = returns.drop('SPY', axis=1) if 'SPY' in returns.columns else returns
+
         residual_returns, factor_returns, factor_betas, explained_variance = calculate_pca_residuals(
-            non_market_returns, n_components
+            ticker_returns, n_components
         )
 
         factor_data['betas'] = factor_betas

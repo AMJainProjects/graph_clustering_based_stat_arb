@@ -10,7 +10,7 @@ import random
 
 from data_preprocessing import prepare_stock_data, prepare_multifactor_data
 from correlation_matrix import compute_correlation_matrix
-from clustering import cluster_stocks, get_clusters_dict
+from clustering import cluster_stocks, get_clusters_dict, determine_clusters_variance, determine_clusters_mp
 from portfolio_construction import (
     identify_winners_losers,
     construct_arbitrage_portfolios,
@@ -35,14 +35,14 @@ class StatisticalArbitrageBacktest:
             start_date: str,
             end_date: str,
             clustering_method: str = 'sponge_sym',
-            beta_window: int = 60,
-            correlation_window: int = 20,
-            lookback_window: int = 5,
+            beta_window: int = 120,
+            correlation_window: int = 40,
+            lookback_window: int = 30,
             rebalance_period: int = 3,
-            threshold: float = 0.0,
+            threshold: float = 0.005,
             stop_win_threshold: Optional[float] = 0.05,
             market_cap_percentile: float = 0.75,
-            n_clusters_method: str = 'mp',
+            n_clusters_method: Optional[str] = None,
             fixed_n_clusters: Optional[int] = None,
             factor_model: str = 'capm',
             use_dynamic_parameters: bool = False,
@@ -118,7 +118,7 @@ class StatisticalArbitrageBacktest:
             self.residual_returns = residual_returns
             self.factor_returns = pd.DataFrame({'MKT': returns['SPY']})
             self.factor_data = {'betas': betas}
-        else:
+        elif self.factor_model == 'fama_french':
             # Use multi-factor model
             returns, factor_returns, residual_returns, factor_data = prepare_multifactor_data(
                 self.tickers,
@@ -405,6 +405,9 @@ class StatisticalArbitrageBacktest:
 
                 # Calculate correlation matrix
                 correlation_matrix = compute_correlation_matrix(lookback_data)
+                correlation_matrix = correlation_matrix.drop(labels='SPY', errors='ignore')
+                correlation_matrix = correlation_matrix.drop(index=['SPY'], axis=1, errors='ignore')
+                correlation_matrix = correlation_matrix.drop(columns=['SPY'], axis=0, errors='ignore')
 
                 # Determine number of clusters
                 n_clusters = self.fixed_n_clusters
@@ -415,21 +418,25 @@ class StatisticalArbitrageBacktest:
                             correlation_matrix,
                             lookback_periods=current_corr_window
                         )[1]
-                    else:
+                    elif self.n_clusters_method == 'var':
                         # Use variance explained method
                         n_clusters = cluster_stocks(
                             correlation_matrix
                         )[1]
+                    else:
+                        n_clusters_mp = determine_clusters_mp(correlation_matrix, self.correlation_window)
+                        n_clusters_var = determine_clusters_variance(correlation_matrix, variance_explained=0.9)
+                        n_clusters = int((n_clusters_mp + n_clusters_var) / 2)
 
                 # Cluster stocks
                 labels, _ = cluster_stocks(
                     correlation_matrix,
-                    method=self.clustering_method,
+                    method='hierarchical',
                     n_clusters=n_clusters
                 )
 
                 clusters = get_clusters_dict(
-                    labels, self.residual_returns.columns.tolist()
+                    labels, correlation_matrix.columns.tolist()
                 )
 
                 # Store cluster information
@@ -452,6 +459,8 @@ class StatisticalArbitrageBacktest:
                     thresholds = self._apply_order_flow_data(current_threshold, date)
                 else:
                     thresholds = {ticker: current_threshold for ticker in self.returns.columns}
+
+                thresholds = thresholds if (thresholds is not None and type(thresholds) != dict) else self.threshold
 
                 # Identify winners and losers
                 winners, losers = identify_winners_losers(
@@ -478,10 +487,11 @@ class StatisticalArbitrageBacktest:
                 previous_portfolio = current_portfolio.copy()
 
             # Calculate daily returns for current portfolio
-            if current_portfolio and i < len(self.returns) - 1:
+            # Calculate daily returns for current portfolio
+            if current_portfolio and i < len(self.residual_returns) - 1:
                 # Get next day's returns
-                next_day = self.returns.index[i + 1]
-                next_day_returns = self.returns.loc[next_day]
+                next_day = self.residual_returns.index[i + 1]
+                next_day_returns = self.residual_returns.loc[next_day]
 
                 # Calculate portfolio returns with transaction costs
                 day_returns = {}
@@ -512,7 +522,15 @@ class StatisticalArbitrageBacktest:
                         # Apply transaction cost (5 basis points)
                         tc = turnover * 0.0005
                         day_tc[f"Cluster_{cluster_id}"] = tc
-                        self.transaction_costs.loc[next_day, 'TC'] += tc
+
+                        # Add safe handling for transaction costs
+                        if next_day in self.transaction_costs.index:
+                            self.transaction_costs.loc[next_day, 'TC'] += tc
+                        else:
+                            # Handle case where date doesn't exist in index
+                            print(
+                                f"Warning: Date {next_day} not found in transaction_costs index. Skipping TC recording.")
+
                         self.total_transaction_cost += tc
 
                     # Sum weighted returns
@@ -539,12 +557,14 @@ class StatisticalArbitrageBacktest:
                         all_portfolio_returns[col] = 0.0
                         all_portfolio_returns.loc[next_day, col] = ret
 
-                # Store transaction costs
+                # Store transaction costs with safe handling
                 for col, tc in day_tc.items():
                     tc_col = f"{col}_TC"
                     if tc_col not in all_portfolio_returns.columns:
                         all_portfolio_returns[tc_col] = 0.0
-                    all_portfolio_returns.loc[next_day, tc_col] = tc
+
+                    if next_day in all_portfolio_returns.index:
+                        all_portfolio_returns.loc[next_day, tc_col] = tc
 
                 # Check for stop-win
                 if current_stop_win is not None:

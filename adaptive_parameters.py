@@ -77,7 +77,7 @@ class AdaptiveParameterManager:
                 n_components=self.n_regimes,
                 covariance_type="full",
                 n_iter=1000,
-                random_state=42
+                random_state=42,
             )
             
             model.fit(X)

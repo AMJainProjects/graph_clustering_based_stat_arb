@@ -112,48 +112,75 @@ def plot_clusters(
 ):
     """
     Plots the correlation matrix with stocks sorted by cluster.
-    
+
     Args:
         correlation_matrix: DataFrame with correlation matrix
         labels: Array of cluster assignments
         ticker_names: Optional list of ticker names (if not in correlation_matrix)
     """
+    """
+        Plots the correlation matrix with stocks sorted by cluster.
+
+        Args:
+            correlation_matrix: DataFrame with correlation matrix
+            labels: Array of cluster assignments or tuple (labels, n_clusters)
+            ticker_names: Optional list of ticker names (if not in correlation_matrix)
+        """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Handle the case where labels is a tuple (labels, n_clusters)
+    if isinstance(labels, tuple) and len(labels) == 2:
+        print("Detected tuple of (labels, n_clusters). Extracting labels...")
+        labels = labels[0]
+
+    # Convert to numpy array if not already
+    if not isinstance(labels, np.ndarray):
+        labels = np.array(labels)
+
+    # Handle multi-dimensional arrays
+    if labels.ndim > 1:
+        print(f"Warning: labels array is {labels.ndim}-dimensional. Flattening...")
+        labels = np.argmax(labels, axis=1) if labels.shape[1] > 1 else labels.flatten()
+
     if ticker_names is None:
         ticker_names = correlation_matrix.columns.tolist()
-    
+
     # Create a mapping from tickers to indices
     ticker_indices = {ticker: i for i, ticker in enumerate(ticker_names)}
-    
+
     # Sort tickers by cluster
     sorted_indices = np.argsort(labels)
     sorted_tickers = [ticker_names[i] for i in sorted_indices]
-    
+    sorted_labels = labels[sorted_indices]
+
     # Reorder the correlation matrix
     sorted_corr = correlation_matrix.loc[sorted_tickers, sorted_tickers]
-    
+
     # Plot the sorted correlation matrix
     plt.figure(figsize=(12, 10))
     plt.imshow(sorted_corr, cmap='coolwarm', vmin=-1, vmax=1)
     plt.colorbar(label='Correlation')
     plt.title('Correlation Matrix Sorted by Clusters')
-    
+
     # Add ticker labels
-    plt.xticks(range(len(sorted_tickers)), sorted_tickers, rotation=90)
-    plt.yticks(range(len(sorted_tickers)), sorted_tickers)
-    
+    plt.xticks(range(len(sorted_tickers)), sorted_tickers, rotation=90, fontsize=8)
+    plt.yticks(range(len(sorted_tickers)), sorted_tickers, fontsize=8)
+
     # Add cluster boundaries
-    cluster_boundaries = []
-    current_cluster = labels[sorted_indices[0]]
-    
-    for i, idx in enumerate(sorted_indices[1:], 1):
-        if labels[idx] != current_cluster:
-            cluster_boundaries.append(i - 0.5)
-            current_cluster = labels[idx]
-    
-    for boundary in cluster_boundaries:
-        plt.axhline(y=boundary, color='black', linestyle='-', linewidth=1)
-        plt.axvline(x=boundary, color='black', linestyle='-', linewidth=1)
-    
+    unique_labels = np.unique(sorted_labels)
+    cluster_sizes = [np.sum(sorted_labels == label) for label in unique_labels]
+
+    boundaries = []
+    current_pos = 0
+    for size in cluster_sizes[:-1]:  # Skip the last one as we don't need a boundary after it
+        current_pos += size
+        boundaries.append(current_pos - 0.5)
+
+    for boundary in boundaries:
+        plt.axhline(y=boundary, color='black', linestyle='-', linewidth=2)
+        plt.axvline(x=boundary, color='black', linestyle='-', linewidth=2)
+
     plt.tight_layout()
     plt.show()
 
