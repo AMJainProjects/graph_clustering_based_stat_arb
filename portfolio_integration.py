@@ -412,38 +412,74 @@ class PortfolioAllocator:
             })
         
         return pd.DataFrame(results)
-    
+
     def cluster_strategies(self, n_clusters: Optional[int] = None, threshold: float = 0.5) -> Dict:
         """
-        Groups strategies by their correlation characteristics.
-        
+        Groups strategies by their correlation characteristics with improved compatibility.
+
         Args:
             n_clusters: Number of clusters (or None for automatic)
             threshold: Distance threshold for clustering
-            
+
         Returns:
             Dictionary with clustering results
         """
         # Convert correlation to distance
         distance_matrix = 1 - np.abs(self.correlation_matrix.values)
-        
-        # Apply hierarchical clustering
-        if n_clusters is not None:
-            clustering = AgglomerativeClustering(
-                n_clusters=n_clusters,
-                affinity='precomputed',
-                linkage='complete'
-            )
-        else:
-            clustering = AgglomerativeClustering(
-                n_clusters=None,
-                distance_threshold=threshold,
-                affinity='precomputed',
-                linkage='complete'
-            )
-        
-        labels = clustering.fit_predict(distance_matrix)
-        
+
+        # Apply hierarchical clustering with improved compatibility for different sklearn versions
+        try:
+            # Try the standard approach first
+            if n_clusters is not None:
+                clustering = AgglomerativeClustering(
+                    n_clusters=n_clusters,
+                    affinity='precomputed',
+                    linkage='complete'
+                )
+            else:
+                clustering = AgglomerativeClustering(
+                    n_clusters=None,
+                    distance_threshold=threshold,
+                    affinity='precomputed',
+                    linkage='complete'
+                )
+
+            labels = clustering.fit_predict(distance_matrix)
+
+        except TypeError as e:
+            print(f"Warning: {e}")
+            print("Trying alternative clustering approach...")
+
+            # For older scikit-learn versions that don't support 'affinity' with distance_threshold
+            if n_clusters is not None:
+                # Use n_clusters approach
+                from scipy.cluster.hierarchy import linkage, fcluster
+
+                # Convert distance matrix to condensed form
+                from scipy.spatial.distance import squareform
+                condensed_dist = squareform(distance_matrix)
+
+                # Perform hierarchical clustering
+                Z = linkage(condensed_dist, method='complete')
+
+                # Cut the dendrogram to get n_clusters
+                labels = fcluster(Z, n_clusters, criterion='maxclust') - 1  # zero-based
+
+            else:
+                # Use standard approach with default affinity
+                # This may work for some versions but input data needs to be features
+                # For those cases, we'll use a fixed number of clusters as fallback
+                print("Using fixed number of clusters as fallback")
+                n_clusters = max(2, len(self.strategy_names) // 3)  # Reasonable default
+
+                clustering = AgglomerativeClustering(
+                    n_clusters=n_clusters,
+                    linkage='complete'
+                )
+
+                # Use correlation as features (not ideal but will work)
+                labels = clustering.fit_predict(self.correlation_matrix.values)
+
         # Group strategies by cluster
         clusters = {}
         for i, strategy in enumerate(self.strategy_names):
@@ -451,7 +487,7 @@ class PortfolioAllocator:
             if cluster_id not in clusters:
                 clusters[cluster_id] = []
             clusters[cluster_id].append(strategy)
-        
+
         return {
             'labels': labels,
             'clusters': clusters,

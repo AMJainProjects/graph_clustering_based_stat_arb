@@ -1412,6 +1412,16 @@ def run_industry_benchmark(
         # Sortino ratio
         metrics.loc[col, 'Sortino Ratio'] = calculate_sortino_ratio(returns)
 
+        # Add Maximum Drawdown calculation
+        cumulative_returns = (1 + returns).cumprod()
+        running_max = cumulative_returns.cummax()
+        drawdown = (cumulative_returns / running_max) - 1
+        metrics.loc[col, 'Maximum Drawdown (%)'] = drawdown.min() * 100
+
+        # Add Win Rate calculation
+        win_rate = (returns > 0).mean()
+        metrics.loc[col, 'Win Rate (%)'] = win_rate * 100
+
     return portfolio_returns, metrics
 
 
